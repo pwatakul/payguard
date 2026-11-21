@@ -22,8 +22,9 @@ type merchantJevConditionResult struct {
 }
 
 type merchantSemanticQuestion struct {
-	ObservedText string `json:"observed_text"`
-	Criterion    string `json:"criterion"`
+	ObservedText string                    `json:"observed_text"`
+	Criterion    string                    `json:"criterion"`
+	Rule         *jevPolicyDraftDefinition `json:"rule,omitempty"`
 }
 
 type pendingMerchantSemanticCondition struct {
@@ -123,6 +124,7 @@ func prepareMerchantSemanticRule(rule merchantPolicyRule, evidence merchantPolic
 			return plan, matched, true
 		}
 	}
+	definition := sanitizeJevRuleDefinition(definitionFromProposal(rule.Proposal))
 	for index, condition := range rule.Proposal.Conditions.Rules {
 		if condition.Operator != semanticOperator {
 			continue
@@ -132,6 +134,7 @@ func prepareMerchantSemanticRule(rule merchantPolicyRule, evidence merchantPolic
 				RuleID: rule.ID, Version: rule.Version, ConditionIndex: index, Field: condition.Field, Answer: "UNKNOWN",
 			},
 		}
+		check.question.Rule = definition
 		if condition.Field == policyDescription || customSignalKey.MatchString(condition.Field) {
 			json.Unmarshal(evidence.custom[condition.Field], &check.question.ObservedText)
 			json.Unmarshal(condition.Value, &check.question.Criterion)

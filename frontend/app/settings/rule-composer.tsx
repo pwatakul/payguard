@@ -53,16 +53,25 @@ type RuleDefinition = {
 type Interpretation = {
   status: "READY" | "CLARIFICATION";
   proposal?: Proposal;
+  draftProposal?: MerchantProposal;
   definition?: RuleDefinition;
   message?: string;
+  clarificationCode?: string;
   source?: "openai" | "local" | "local_fallback" | "manual";
   model?: string;
+  jevReview?: {
+    status: "LIVE" | "MOCKED" | "TIMEOUT" | "UNAVAILABLE" | "NOT_RUN";
+    model?: string;
+    decisionId?: string;
+    answer?: "ALIGNED" | "NEEDS_REVIEW" | "INSUFFICIENT";
+    fallbackUsed?: boolean;
+  };
   validation: { valid: boolean; errors?: string[]; warnings?: string[] };
   semanticDraft?: { field: string };
 };
 type DraftPreview = Interpretation & { sourceInstruction?: string };
 
-type PolicyPreview = { evaluated: number; matched: number; missing: number; requiresJev?: number; conflictRuleIds?: string[]; approvalReason?: string };
+type PolicyPreview = { evaluated: number; matched: number; missing: number; requiresJev?: number; conflictRuleIds?: string[]; approvalReason?: string; missingSignals?: string[] };
 type PolicyRule = {
   id: string;
   version: number;
@@ -96,9 +105,11 @@ export type BusinessProfile = {
 const scopeLabels = { MERCHANT: "Merchant AI Rule", PLATFORM: "Platform fraud rule" };
 const products: Record<string, string> = merchantPolicyProducts;
 const mailboxField = "customer.mailbox_ref";
+const ipCountryField = "custom_ip_country";
 const mailboxExample = "Block email buyer@example.test for 2 minutes";
 const jevConditionLabel = "Custom rule · Jev";
 const fields: Record<string, string> = {
+  [ipCountryField]: "IP country",
   ...merchantFieldLabels,
   account_age_days: "Account age in days",
   device_orders: "Orders from this device in 60 seconds",
@@ -254,9 +265,11 @@ function legacyRuleDefinition(proposal: Proposal): RuleDefinition {
 }
 
 export function RulePreview({ proposal, definition, mailbox, profile }: {
-  proposal: Proposal; definition?: RuleDefinition; mailbox?: string; profile?: BusinessProfile | null;
+  proposal?: Proposal; definition?: RuleDefinition; mailbox?: string; profile?: BusinessProfile | null;
 }) {
-  const rule = definition?.schemaVersion === 1 && definition.scope === proposal.scope ? definition : legacyRuleDefinition(proposal);
+  const rule = definition?.schemaVersion === 1 && (!proposal || definition.scope === proposal.scope)
+    ? definition : proposal ? legacyRuleDefinition(proposal) : undefined;
+  if (!rule) return null;
   const { name, action, stages: ruleStages, duration } = rule;
   const merchant = rule.scope === "MERCHANT";
   const conditions = rule.conditions.rules;
@@ -301,6 +314,24 @@ export function RulePreview({ proposal, definition, mailbox, profile }: {
 
 function RuleActionBadge({ action }: { action: string }) {
   return <span className={stateBadge(ruleActionTone(action))}>{policyActionLabels[action] ?? action}</span>;
+}
+
+function JevDraftReview({ review }: { review: NonNullable<Interpretation["jevReview"]> }) {
+  const result = review.answer === "ALIGNED" ? "Aligned" : review.answer === "NEEDS_REVIEW"
+    ? "Needs review" : "More information needed";
+  const message = {
+    LIVE: `Jev review · ${result}`,
+    MOCKED: "Jev review · Mock mode",
+    TIMEOUT: "Jev review timed out",
+    UNAVAILABLE: "Jev review unavailable",
+    NOT_RUN: "Jev review did not run",
+  }[review.status];
+  const reassuring = review.status === "LIVE" && review.answer === "ALIGNED";
+  return <div role="status" className="space-y-1 text-xs text-muted">
+    <span className={stateBadge(reassuring ? "info" : "warning")}>{message}</span>
+    {review.model && <p>{review.model}{review.fallbackUsed ? " · Fallback model" : ""}</p>}
+    {review.decisionId && <p className="break-all">Decision {review.decisionId}</p>}
+  </div>;
 }
 
 export function PolicyExpiry({ expiresAt, status }: Pick<PolicyRule, "expiresAt" | "status">) {
@@ -405,8 +436,8 @@ function ConnectedComposer({ scope, token, localAdmin = false, adminMerchantId, 
     setShowPriceUnitQuestion(false);
     const containsAddress = scope === "MERCHANT" && containsMailbox(text);
     try {
-      const payload: { scope: Scope; instruction: string; mailboxDigest?: string; requireAI: true } =
-        { scope, instruction: text.trim(), requireAI: true };
+      const payload: { scope: Scope; instruction: string; mailboxDigest?: string; requireAI: true; reviewWithJev: true } =
+        { scope, instruction: text.trim(), requireAI: true, reviewWithJev: true };
       if (containsAddress) {
         if (!profile?.merchantId) throw new Error("The merchant profile is unavailable. Reconnect and try again.");
         const masked = maskMailboxInstruction(text);
@@ -421,11 +452,20 @@ function ConnectedComposer({ scope, token, localAdmin = false, adminMerchantId, 
         : await authenticatedRequest<Interpretation>(adminRulePath(`${composer}/interpret`, localAdmin, token), token, init);
       if (controller.signal.aborted) return;
       if (result.source !== "openai") throw new Error("This server did not generate the draft with OpenAI. Try again after updating the Rule Composer.");
-      if (containsAddress && result.status === "CLARIFICATION" && needsMailboxPriceUnit(payload.instruction)) {
+      if (containsAddress && result.status === "CLARIFICATION" &&
+          (result.clarificationCode === "AMOUNT_UNIT_REQUIRED" ||
+            (!result.clarificationCode && needsMailboxPriceUnit(payload.instruction)))) {
         setShowPriceUnitQuestion(true);
+        setDraft({ ...result, message: undefined });
         return;
       }
-      if (result.proposal && result.proposal.scope !== scope) throw new Error("The proposal belongs to another rule system.");
+      if ((result.proposal && result.proposal.scope !== scope) || (result.definition && result.definition.scope !== scope)) {
+        throw new Error("The proposal belongs to another rule system.");
+      }
+      if (result.draftProposal && (scope !== "MERCHANT" || result.draftProposal.scope !== scope ||
+          !result.draftProposal.conditions.rules.some(condition => condition.field === mailboxField))) {
+        throw new Error("The pending draft is missing the exact email condition. Draft the rule again.");
+      }
       if (containsAddress && result.status === "READY" && (result.proposal?.scope !== "MERCHANT" ||
           !result.proposal.conditions.rules.some(condition => condition.field === mailboxField))) {
         throw new Error("The draft is missing the exact email condition. Try drafting the rule again.");
@@ -457,9 +497,13 @@ function ConnectedComposer({ scope, token, localAdmin = false, adminMerchantId, 
     void draftInstruction(updated);
   }
 
+  const ready = draft?.status === "READY" && draft.validation.valid && Boolean(draft.proposal);
+  const pendingProposal = draft?.status === "CLARIFICATION" && draft.clarificationCode === "IP_COUNTRY_UNAVAILABLE"
+    ? draft.draftProposal : undefined;
+
   async function save() {
-    const proposal = draft?.proposal;
-    if (request.current || !proposal || draft?.status !== "READY" || !draft.validation.valid) return;
+    const proposal = ready ? draft?.proposal : pendingProposal;
+    if (request.current || !proposal) return;
     const controller = new AbortController();
     request.current = controller;
     setPending("save");
@@ -468,7 +512,8 @@ function ConnectedComposer({ scope, token, localAdmin = false, adminMerchantId, 
       const payload = proposal.scope === "MERCHANT" ? {
         proposal,
         expectedVersion: editVersion.current,
-        instruction: draft.sourceInstruction,
+        instruction: draft?.sourceInstruction,
+        saveAsDraft: pendingProposal ? true : undefined,
       } : { proposal, runId: runId || undefined };
       const init = { method: edit ? "PUT" : "POST", body: JSON.stringify(payload), signal: controller.signal };
       const result = proposal.scope === "MERCHANT"
@@ -486,9 +531,10 @@ function ConnectedComposer({ scope, token, localAdmin = false, adminMerchantId, 
     }
   }
 
-  const ready = draft?.status === "READY" && draft.validation.valid && Boolean(draft.proposal);
+  const savedForSetup = saved?.status === "PENDING_APPROVAL" && Boolean(saved.rule.preview.missingSignals?.length);
   const reason = saved?.status === "DRAFT"
     ? "Platform proposals are saved as drafts for review."
+    : savedForSetup ? "Saved as a draft. Connect IP country, then activate it from Saved rules."
     : saved?.status === "PENDING_APPROVAL" ? "Review the validation evidence before activating this version." : "";
   const preview = saved && "preview" in saved.rule ? saved.rule.preview : saved && "preview" in saved ? saved.preview : undefined;
   const messages = [...(draft?.validation.errors ?? []), ...(draft?.validation.warnings ?? [])];
@@ -564,6 +610,7 @@ function ConnectedComposer({ scope, token, localAdmin = false, adminMerchantId, 
           local_fallback: "PayGuard fallback", manual: "Manual preview" }[draft.source]}
       </span>
     </div>}
+    {draft?.jevReview && <JevDraftReview review={draft.jevReview} />}
     {suggestedField && canUseBuilder && profile && <div className="space-y-2 rounded-lg bg-paper p-3 text-sm">
       {draft?.message && <p role="status">{draft.message}</p>}
       <button className={outlineButton} type="button" disabled={pending !== null}
@@ -586,12 +633,23 @@ function ConnectedComposer({ scope, token, localAdmin = false, adminMerchantId, 
       </div>
     </details>}
     {draft && (!suggestedField || !canUseBuilder) && <div className="space-y-3">
-      {draft.message && <p role="status" className="text-sm text-muted">{draft.message}</p>}
+      {draft.status === "CLARIFICATION" && draft.clarificationCode === "IP_COUNTRY_UNAVAILABLE" ?
+        <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+          <p role="status">{draft.message}</p>
+          {adminMerchantId && <Link className="font-semibold text-accent hover:underline"
+            href={merchantDetailsHref(adminMerchantId)} target="_blank" rel="noopener">
+            Open merchant setup in a new tab
+          </Link>}
+        </div> : draft.message && <p role="status" className="text-sm text-muted">{draft.message}</p>}
       {messages.length > 0 && <ul className="list-disc space-y-1 pl-5 text-sm text-amber-900">
         {messages.map((message, index) => <li key={index}>{message}</li>)}
       </ul>}
-      {draft.proposal && <RulePreview proposal={draft.proposal} definition={draft.definition} mailbox={previewMailbox} profile={profile} />}
-      {ready && !saved && <>
+      {(draft.proposal || draft.definition) && <RulePreview
+        proposal={draft.proposal} definition={draft.definition} mailbox={previewMailbox} profile={profile} />}
+      {(ready || pendingProposal) && !saved && <>
+        {pendingProposal && <p className="text-sm text-muted">
+          Save this rule as a draft now. Connect IP country before activating it.
+        </p>}
         {scope === "PLATFORM" && runs.length > 0 && <label className="block text-sm font-semibold">Simulation run for replay (optional)
           <select className="control mt-1 max-w-md" value={runId} onChange={event => setRunId(event.currentTarget.value)} disabled={pending !== null}>
             <option value="">Save as draft without a replay</option>
@@ -609,7 +667,7 @@ function ConnectedComposer({ scope, token, localAdmin = false, adminMerchantId, 
       ? "border-amber-200 bg-amber-50 text-amber-950" : "border-sky-200 bg-sky-50 text-sky-950"}`}>
       <div className="flex flex-wrap items-center gap-2">
         <p className="font-semibold">Rule saved</p>
-        <span className={stateBadge(statusTone[saved.status])}>{statusLabels[saved.status]}</span>
+        <span className={stateBadge(statusTone[saved.status])}>{savedForSetup ? "Draft" : statusLabels[saved.status]}</span>
       </div>
       {reason && <p className="mt-1">{reason}</p>}
       {"expiresAt" in saved.rule && <PolicyExpiry expiresAt={saved.rule.expiresAt} status={saved.rule.status} />}
@@ -621,9 +679,9 @@ function ConnectedComposer({ scope, token, localAdmin = false, adminMerchantId, 
 
 type RuleHistory = { rule: PolicyRule; versions: PolicyRule[] };
 
-function ConnectedPolicyRules({ token, adminMerchantId, profile, refreshKey, onEdit, onDelete }: {
+function ConnectedPolicyRules({ token, adminMerchantId, profile, refreshKey, onEdit, onDelete, onRefreshProfile }: {
   token: string; adminMerchantId?: string; profile: BusinessProfile | null; refreshKey: number;
-  onEdit: (rule: PolicyRule) => void; onDelete: (ruleId: string) => void;
+  onEdit: (rule: PolicyRule) => void; onDelete: (ruleId: string) => void; onRefreshProfile: () => void;
 }) {
   const [rules, setRules] = useState<PolicyRule[]>([]);
   const [error, setError] = useState("");
@@ -746,7 +804,7 @@ function ConnectedPolicyRules({ token, adminMerchantId, profile, refreshKey, onE
         </p>}
       </div>
       <button type="button" className={outlineButton} disabled={loading || legacyLoading || !!busy}
-        onClick={() => setRevision(value => value + 1)}>Refresh rules</button>
+        onClick={() => { setRevision(value => value + 1); onRefreshProfile(); }}>Refresh rules</button>
     </div>
     {(loading || legacyLoading) && <p role="status" className="text-sm text-muted">Loading rules…</p>}
     {error && <p role="alert" className="text-sm text-red-800">{error}</p>}
@@ -754,12 +812,18 @@ function ConnectedPolicyRules({ token, adminMerchantId, profile, refreshKey, onE
     {notice && <p role="status" className="text-sm text-emerald-900">{notice}</p>}
     {!loading && !legacyLoading && !error && !legacyError && !rules.length && !legacy?.rules.length && <p className="text-sm text-muted">No saved rules.</p>}
     {(rules.length > 0 || !!legacy?.rules.length) && <ul className="divide-y divide-line">
-      {rules.map(rule => <li className="space-y-3 py-3" key={rule.id}>
+      {rules.map(rule => {
+        const savedDraft = rule.status === "PENDING_APPROVAL" && rule.preview?.missingSignals?.includes(ipCountryField);
+        const awaitingIPCountry = savedDraft && !profile?.fieldRegistry?.some(field =>
+          field.fieldName === ipCountryField && field.dataType === "country" &&
+          rule.proposal.product_types.every(product => field.supportedProductTypes.includes(product)) &&
+          rule.proposal.stages.every(stage => field.availableStages.includes(stage)));
+        return <li className="space-y-3 py-3" key={rule.id}>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="text-sm font-semibold wrap-anywhere">{rule.proposal.name}</p>
             <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-              <span className={stateBadge(statusTone[rule.status])}>{statusLabels[rule.status]}</span>
+              <span className={stateBadge(statusTone[rule.status])}>{savedDraft ? "Draft" : statusLabels[rule.status]}</span>
               <RuleActionBadge action={rule.proposal.action} />
               <span className="text-xs text-muted">Version {rule.version}</span>
               {rule.proposal.conditions.rules.some(condition => condition.operator === "semantic_match") &&
@@ -769,6 +833,7 @@ function ConnectedPolicyRules({ token, adminMerchantId, profile, refreshKey, onE
             </div>
             <PolicyExpiry expiresAt={rule.expiresAt} status={rule.status} />
             {rule.preview && <PolicySample preview={rule.preview} />}
+            {awaitingIPCountry && <p className="mt-2 text-sm text-amber-950">Connect IP country, then refresh to activate this draft.</p>}
             {rule.status === "PENDING_APPROVAL" && Boolean(rule.preview?.conflictRuleIds?.length) &&
               <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-sm text-amber-950">
                 Multiple policies can match after activation. Block takes priority over Review, then Challenge.
@@ -779,14 +844,14 @@ function ConnectedPolicyRules({ token, adminMerchantId, profile, refreshKey, onE
               onEdit(rule);
               document.getElementById("merchant-policy-editor")?.focus();
             }}><Pencil className="size-4 shrink-0" aria-hidden="true" />Edit</button>
-            <button type="button" className={outlineButton} disabled={Boolean(busy)} onClick={() => void change(rule, "simulate")}>
+            <button type="button" className={outlineButton} disabled={Boolean(busy) || awaitingIPCountry} onClick={() => void change(rule, "simulate")}>
               <FlaskConical className="size-4 shrink-0" aria-hidden="true" />Test rule
             </button>
             <button type="button" className={outlineButton} disabled={Boolean(busy)} onClick={() => {
               if (history?.rule.id === rule.id) setHistory(null);
               else void change(rule, "history");
             }}><History className="size-4 shrink-0" aria-hidden="true" />{history?.rule.id === rule.id ? "Hide versions" : "Versions"}</button>
-            {rule.status === "PENDING_APPROVAL" && <button type="button" className={actionButton.positive} disabled={Boolean(busy)}
+            {rule.status === "PENDING_APPROVAL" && <button type="button" className={actionButton.positive} disabled={Boolean(busy) || awaitingIPCountry}
               onClick={() => void change(rule, "activate")}><Play className="size-4 shrink-0" aria-hidden="true" />Activate</button>}
             {(rule.status === "ACTIVE" || rule.activeVersion) && <button type="button" className={actionButton.warning} disabled={Boolean(busy)}
               onClick={() => void change(rule, "disable")}><Pause className="size-4 shrink-0" aria-hidden="true" />Disable</button>}
@@ -826,7 +891,8 @@ function ConnectedPolicyRules({ token, adminMerchantId, profile, refreshKey, onE
             </div>
           </li>)}
         </ul>}
-      </li>)}
+      </li>;
+      })}
       {legacy?.rules.map(rule => <LegacyJevRuleItem key={rule.id} rule={rule} version={legacy.version} busy={!!busy || legacyLoading}
         onChange={proposal => changeLegacy(rule.id, proposal)} />)}
     </ul>}
@@ -854,7 +920,8 @@ function MerchantPolicyWorkspace({ token, adminMerchantId }: { token: string; ad
       <ConnectedComposer key={`${edit?.id ?? ""}:${edit?.version ?? ""}`} scope="MERCHANT" token={token} adminMerchantId={adminMerchantId}
         merchantProfile={merchantProfile} edit={edit} onCancel={() => setEdit(undefined)} onSaved={() => setRefreshKey(value => value + 1)} />
     </div>
-    <ConnectedPolicyRules token={token} adminMerchantId={adminMerchantId} profile={merchantProfile.profile} refreshKey={refreshKey} onEdit={setEdit}
+    <ConnectedPolicyRules token={token} adminMerchantId={adminMerchantId} profile={merchantProfile.profile} refreshKey={refreshKey}
+      onEdit={setEdit} onRefreshProfile={merchantProfile.retryProfile}
       onDelete={id => setEdit(current => current?.id === id ? undefined : current)} />
   </>;
 }

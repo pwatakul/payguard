@@ -47,11 +47,21 @@ func TestMerchantSemanticRulesBatchOnlyRelevantEvidence(t *testing.T) {
 			t.Fatal(err)
 		}
 		expectedState := map[string]merchantSemanticQuestion{
-			"condition_1": {"One-day pass to enter a theme park", "Theme park admission"},
-			"condition_2": {"Shuttle bus to the park", "Theme park admission"},
+			"condition_1": {ObservedText: "One-day pass to enter a theme park", Criterion: "Theme park admission"},
+			"condition_2": {ObservedText: "Shuttle bus to the park", Criterion: "Theme park admission"},
 		}
-		if !reflect.DeepEqual(body.State, expectedState) || len(body.Questions) != 2 {
-			t.Fatalf("unexpected evidence or question count: %+v", body)
+		if len(body.Questions) != 2 || len(body.State) != 2 {
+			t.Fatalf("unexpected question count: %+v", body)
+		}
+		for key, expected := range expectedState {
+			got := body.State[key]
+			if got.Rule == nil || got.Rule.Scope != composerMerchant || got.Rule.Conditions.Logic != "AND" {
+				t.Fatalf("expected sanitized rule structure for %s: %+v", key, got)
+			}
+			got.Rule = nil
+			if !reflect.DeepEqual(got, expected) {
+				t.Fatalf("unexpected evidence for %s: %+v", key, got)
+			}
 		}
 		for key, q := range body.Questions {
 			if _, exists := body.State[key]; !exists || q.Type != "choice" || len(q.Criteria) != 3 {

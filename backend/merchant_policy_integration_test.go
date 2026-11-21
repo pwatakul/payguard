@@ -240,6 +240,159 @@ func TestMerchantPolicyLifecyclePostgres(t *testing.T) {
 	}
 }
 
+func TestMerchantPolicySavePendingIPCountryPostgres(t *testing.T) {
+	db := openPolicyTestDatabase(t)
+	repo := repository{db}
+	mux := http.NewServeMux()
+	registerMerchantDemo(mux, repo, "pending-country-admin")
+	call := func(method, path, token string, input any, expected int) []byte {
+		t.Helper()
+		payload, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(method, path, bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, req)
+		if response.Code != expected {
+			t.Fatalf("%s %s returned %d, want %d: %s", method, path, response.Code, expected, response.Body.String())
+		}
+		return response.Body.Bytes()
+	}
+	mkMerchant := func(name string) (mockMerchant, string) {
+		t.Helper()
+		merchant, token, err := repo.createMockMerchant(t.Context(), mockMerchantInput{
+			Name: name, PolicyIntegration: &merchantPolicyIntegration{Products: []string{"flight_ticket"}, AmountMinor: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return merchant, token
+	}
+	merchant, token := mkMerchant("pending network evidence merchant")
+	other, otherToken := mkMerchant("other network evidence merchant")
+	mailbox, err := merchantMailboxRef(t.Context(), db, merchant.ID, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherMailbox, err := merchantMailboxRef(t.Context(), db, other.ID, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference, err := json.Marshal(mailbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := merchantPolicyProposal{
+		Scope: "MERCHANT", Name: "High-value flight", Action: "REVIEW", ProductTypes: []string{"flight_ticket"}, Stages: []string{"BOOKING"},
+		Conditions: merchantPolicyConditions{Logic: "AND", Rules: []merchantPolicyCondition{
+			{Field: policyAmount, Operator: "gt", Value: json.RawMessage(`300000`)},
+		}},
+	}
+	compound := base
+	compound.Action = "BLOCK"
+	compound.Conditions.Rules = append(slices.Clone(base.Conditions.Rules),
+		merchantPolicyCondition{Field: policyMailbox, Operator: "eq", Value: reference},
+		merchantPolicyCondition{Field: policyIPCountry, Operator: "eq", Value: json.RawMessage(`"US"`)},
+	)
+	invalid := compound
+	invalid.Conditions.Rules = append(slices.Clone(compound.Conditions.Rules),
+		merchantPolicyCondition{Field: "custom_other_required", Operator: "eq", Value: json.RawMessage(`"value"`)},
+	)
+	endpoint := merchantPolicyPath + "/rules"
+	call(http.MethodPost, endpoint, token, map[string]any{"proposal": compound}, http.StatusUnprocessableEntity)
+	call(http.MethodPost, endpoint, token, map[string]any{"proposal": invalid, "saveAsDraft": true}, http.StatusUnprocessableEntity)
+
+	decode := func(raw []byte) merchantPolicyRule {
+		t.Helper()
+		var saved struct{ Rule merchantPolicyRule }
+		if err := json.Unmarshal(raw, &saved); err != nil {
+			t.Fatal(err)
+		}
+		return saved.Rule
+	}
+	draftInput := map[string]any{"proposal": compound, "saveAsDraft": true}
+	firstDraft := decode(call(http.MethodPost, endpoint, token, draftInput, http.StatusCreated))
+	if firstDraft.Status != "PENDING_APPROVAL" || firstDraft.ActiveVersion != 0 ||
+		!slices.Equal(firstDraft.Preview.MissingSignals, []string{policyIPCountry}) || firstDraft.ExpiresAt != nil {
+		t.Fatalf("Expected an inactive draft waiting for country evidence: %+v", firstDraft)
+	}
+	retry := decode(call(http.MethodPost, endpoint, token, draftInput, http.StatusCreated))
+	if retry.ID != firstDraft.ID || retry.Version != firstDraft.Version {
+		t.Fatalf("Retry duplicated the draft: %+v", retry)
+	}
+	rules, err := readMerchantPolicies(t.Context(), db, merchant.ID, true)
+	if err != nil || len(rules) != 0 {
+		t.Fatalf("New draft became effective: %+v, %v", rules, err)
+	}
+	draftPath := endpoint + "/" + firstDraft.ID
+	call(http.MethodGet, draftPath, otherToken, nil, http.StatusNotFound)
+	call(http.MethodPost, draftPath+"/activate", otherToken, map[string]any{"expectedVersion": 1}, http.StatusNotFound)
+	call(http.MethodPost, draftPath+"/activate", token, map[string]any{"expectedVersion": 1}, http.StatusUnprocessableEntity)
+	call(http.MethodPost, draftPath+"/simulate", token, nil, http.StatusUnprocessableEntity)
+
+	base.Name = "Existing active flight review"
+	active := decode(call(http.MethodPost, endpoint, token, map[string]any{"proposal": base}, http.StatusCreated))
+	if active.Status != "ACTIVE" || active.ActiveVersion != 1 {
+		t.Fatalf("Existing rule did not activate: %+v", active)
+	}
+	activePath := endpoint + "/" + active.ID
+	compound.Name = base.Name
+	edit := decode(call(http.MethodPut, activePath, token, map[string]any{"proposal": compound, "expectedVersion": 1, "saveAsDraft": true}, http.StatusOK))
+	if edit.Status != "PENDING_APPROVAL" || edit.ActiveVersion != 1 || edit.Version != 2 {
+		t.Fatalf("Saving a draft edit must retain the previously effective version: %+v", edit)
+	}
+	rules, err = readMerchantPolicies(t.Context(), db, merchant.ID, true)
+	if err != nil || len(rules) != 1 || rules[0].ID != active.ID || rules[0].Version != 1 {
+		t.Fatalf("Draft edit displaced effective rule: %+v, %v", rules, err)
+	}
+	newerDraft := decode(call(http.MethodPut, activePath, token, map[string]any{"proposal": base, "expectedVersion": 2, "saveAsDraft": true}, http.StatusOK))
+	if newerDraft.Status != "PENDING_APPROVAL" || newerDraft.ActiveVersion != 1 || newerDraft.Version != 3 {
+		t.Fatalf("Expected another inactive draft version: %+v", newerDraft)
+	}
+	rollback := map[string]any{"expectedVersion": 3, "version": 2}
+	call(http.MethodPost, activePath+"/rollback", token, rollback, http.StatusUnprocessableEntity)
+
+	register := func(kind string) {
+		t.Helper()
+		_, err := repo.updateMockMerchant(t.Context(), merchant.ID, mockMerchantInput{
+			Name: merchant.Name, PolicyIntegration: &merchantPolicyIntegration{Products: []string{"flight_ticket"}, AmountMinor: true,
+				CustomFields: []customSignalDefinition{{Key: policyIPCountry, Type: kind, Label: "IP country"}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	register("text")
+	call(http.MethodPost, draftPath+"/activate", token, map[string]any{"expectedVersion": 1}, http.StatusUnprocessableEntity)
+	call(http.MethodPost, activePath+"/rollback", token, rollback, http.StatusUnprocessableEntity)
+	register("country")
+	call(http.MethodPost, draftPath+"/simulate", token, nil, http.StatusOK)
+	restored := decode(call(http.MethodPost, activePath+"/rollback", token, rollback, http.StatusOK))
+	if restored.Status != "PENDING_APPROVAL" || restored.ActiveVersion != 1 || len(restored.Preview.MissingSignals) != 0 {
+		t.Fatalf("Restored draft must still require explicit activation: %+v", restored)
+	}
+	published := decode(call(http.MethodPost, draftPath+"/activate", token, map[string]any{"expectedVersion": 1}, http.StatusOK))
+	if published.Status != "ACTIVE" || published.ActiveVersion != 2 || len(published.Preview.MissingSignals) != 0 {
+		t.Fatalf("Draft did not activate after a valid country signal was registered: %+v", published)
+	}
+	amount := int64(300001)
+	evidence := merchantPolicyEvidence{product: "flight_ticket", stage: "BOOKING", amount: &amount, mailboxRef: mailbox}
+	if matched, missing := published.Proposal.evaluate(evidence); matched || !missing {
+		t.Fatal("Missing transaction IP country must remain unresolved after activation.")
+	}
+	evidence.custom = map[string]json.RawMessage{policyIPCountry: json.RawMessage(`"US"`)}
+	if matched, missing := published.Proposal.evaluate(evidence); !matched || missing {
+		t.Fatal("The bound mailbox, flight, amount and US must match the published rule.")
+	}
+	evidence.mailboxRef = otherMailbox
+	if matched, _ := published.Proposal.evaluate(evidence); matched {
+		t.Fatal("Another merchant's mailbox reference must not match the rule.")
+	}
+}
+
 func TestMerchantPolicyLocalTiming(t *testing.T) {
 	db := openPolicyTestDatabase(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)

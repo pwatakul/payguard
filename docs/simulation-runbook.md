@@ -158,7 +158,7 @@ Use a synthetic merchant with **Physical goods**, choose Mock in **AI Configurat
 
 Set `OPENROUTER_API_KEY` in the ignored root `.env` for Compose. In **Decision Engine → AI Configuration**, save the OpenRouter provider. Before a configuration version has been saved, `PAYGUARD_AI_MODE=live` enables the deployment default. The default model is `typesafe/jev-1.14`. Recreate the backend after changing its environment and use the project arguments belonging to the selected stack. [Jev settings](#jev-ai-configuration)
 
-Run a merchant-selected test in each tool with a synthetic amount and the timeout control off. Open the saved **Transactions** records and compare the Jev answer, served model, decision ID and configuration version when available. Local rules also contribute to the final decision. The advisory receives the booking amount, the local review requirement, and bounded booking comparison evidence when a full email matches a prior booking at that merchant. Rules with semantic conditions use the observed text in a separate typed request. The standalone booking and batch workflows have their own mock evaluators.
+Run a merchant-selected test in each tool with a synthetic amount and the timeout control off. Open the saved **Transactions** records and compare the Jev answer, served model, decision ID and configuration version when available. Local rules also contribute to the final decision. The advisory receives the booking amount, the local review requirement, and bounded booking comparison evidence when a full email matches a prior booking at that merchant. Rules with semantic conditions send the necessary observed text, saved criterion, and sanitized saved rule in a separate typed request. The standalone booking and batch workflows have their own mock evaluators.
 
 ## Merchant Management
 
@@ -312,7 +312,7 @@ For a rule that uses `amountMinor`, first approve a Scoring Profile that include
 
 ## Jev AI Configuration
 
-Open **Decision Engine → AI Configuration** as Platform Admin. Select Mock or OpenRouter, the primary and optional fallback Jev models, an advisory rubric, and the total timeout. Save before testing changed settings. A saved version takes precedence over the deployment defaults for new merchant transactions. The provider test is independent of Merchant Rules and Scoring Profiles. [Architecture and supported settings](requirements/decision-engine.md#jev-configuration)
+Open **Decision Engine → AI Configuration** as Platform Admin. Select Mock or OpenRouter, the primary and optional fallback Jev models, an advisory rubric, and the total timeout. Save before testing changed settings. A saved version takes precedence over the deployment defaults for rule draft reviews and new merchant transactions. The provider test is independent of Merchant Rules and Scoring Profiles. [Architecture and supported settings](requirements/decision-engine.md#jev-configuration)
 
 For OpenRouter testing in Compose, set `OPENROUTER_API_KEY` in the ignored root `.env` and recreate the backend. To run Go on the host, export the key into its process environment. The diagnostic sends a server-defined synthetic fixture. The result reports `MOCKED`, `LIVE`, `TIMEOUT`, or `UNAVAILABLE`. A successful `LIVE` diagnostic verifies the response for that fixture. Check a new merchant transaction separately to verify its recorded outcome and pinned configuration.
 
@@ -354,12 +354,12 @@ PAYGUARD_RULE_COMPOSER_PROVIDER=openai
 PAYGUARD_RULE_COMPOSER_MODEL=gpt-4.1-mini
 ```
 
-Set `OPENAI_API_KEY` in the ignored `backend/.env`, which Compose loads into Go. Use a checker token distinct from the administrator token to enable independent Platform Rule approval and rollback. For a host-run backend, export the composer variables and `OPENAI_API_KEY` into the Go process before starting it. For Compose, recreate the backend with `docker compose up -d --wait backend` after an environment change. Build the application after changing code. The OpenRouter key belongs to the [Jev assessment and diagnostic](#jev-ai-configuration). [Rule fields, actions, and lifecycle](requirements/ai-rule-management.md)
+Set `OPENAI_API_KEY` in the ignored `backend/.env`, which Compose loads into Go. Use a checker token distinct from the administrator token to enable independent Platform Rule approval and rollback. For a host-run backend, export the composer variables and `OPENAI_API_KEY` into the Go process before starting it. For Compose, recreate the backend with `docker compose up -d --wait backend` after an environment change. Build the application after changing code. The [Jev settings](#jev-ai-configuration) apply to draft reviews, supported transaction assessments, and the provider diagnostic. [Rule fields, actions, and lifecycle](requirements/ai-rule-management.md)
 
 1. Create a synthetic merchant in **Merchants** as Platform Admin. Enter its catalogue products under **Business and integration settings** and declare email domain support only if the integration supplies it. For the Merchant workspace test, use the one-time Sandbox credential or issue a temporary credential from **Overview**. Existing merchant setup and observed evidence can supply available signals.
-2. As Platform Admin, open **Merchants**, select the shop, and open **AI Rule**. In the Merchant workspace, use **Merchant AI Rules**. Describe the rule in Thai or English and select **Draft rule**. For a merchant that supplies flight tickets and email domains, try “Block flight tickets when email domain equals example.test.” The **OpenAI** label and model identify a result from the live composer. If OpenAI is disabled or unavailable, **Draft rule** shows an error. The composer requires OpenAI in both Platform and Merchant scopes. Review the source, product, stage, signal, and action before selecting **Save Rule**. If the draft asks for more detail, revise the instruction or use **Rule fields**.
+2. As Platform Admin, open **Merchants**, select the shop, and open **AI Rule**. In the Merchant workspace, use **Merchant AI Rules**. Describe the rule in Thai or English and select **Draft rule**. For a merchant that supplies flight tickets and email domains, try “Block flight tickets when email domain equals example.test.” The **OpenAI** label and model identify the author of the draft. Both Platform and Merchant **Draft rule** actions send the sanitized structure to Jev and show a separate advisory status. In live mode, check its answer, served model, and decision ID when available. Mock, timeout, and unavailable states are shown separately. If OpenAI is disabled or unavailable, **Draft rule** shows an error. Review the source, product, stage, signal, and action before selecting **Save Rule**. If the draft asks for more detail, revise the instruction or use **Rule fields**.
 3. Check the saved status and preview counts. Use **Test rule** to replay against recent stored evidence. An active policy applies to future merchant transactions. Submit a matching synthetic transaction in Mock Checkout or the merchant rule panel of Simulation Lab, then inspect the Platform, Merchant Policy, and Final decisions. An older transaction with the same input and ID returns its saved decision.
-4. As Platform Admin, open `/settings/system-rules`. Compose a global rule, select a shared Simulation Lab run for optional replay, and save it as a draft. To request activation in the local test stack, open **Platform rule approval** and submit the current draft with a shared run that has eligible events and a reason.
+4. As Platform Admin, open `/settings/system-rules`. Compose a global rule and check the OpenAI source and separate Jev review. Select a shared Simulation Lab run for optional replay and save it as a draft. To request activation in the local test stack, open **Platform rule approval** and submit the current draft with a shared run that has eligible events and a reason.
 5. Use the independent checker credential to review the pending revision and its recorded replay. Approve with a reason to apply the revision on new Simulation Lab runs. The checker can also restore an earlier active revision or disable the rule. Compare the ruleset version and rule hits on a new run with the original stored run.
 
 ### Test multiple active Merchant Rules
@@ -397,6 +397,14 @@ The browser sends OpenAI's instruction through Go with the address replaced by `
 3. Save the rule and use fresh synthetic transactions to check that it applies only when the mailbox, product, and amount all match. Try another mailbox on `example.test`, a different product, and a flight purchase of exactly 5,000 THB. Check that none of those cases matches this rule.
 4. Check that the provider receives only the sanitized text and eligible rule fields. Go binds the exact mailbox reference locally. With no duration in the instruction, the proposal carries no expiry.
 
+### Exact email with product, price, and IP country
+
+1. In a synthetic merchant workspace that supplies flight tickets and booking amounts, enter `Block email buyer@example.test and product = flight and price > 3000 and IP from USA` in **AI Rule** and select **Draft rule**. Choose **Baht (THB)** when asked for the unit. With no IP-country field registered, expect an OpenAI-authored preview, separate Jev review status, and setup guidance. Verify the exact email, flight scope, amount strictly greater than 300,000 minor units, and `custom_ip_country eq US` under `AND`. Check that the Jev request carries the typed requirements with a masked mailbox value.
+2. Select **Save rule** and reload **Saved rules**. Confirm the rule appears as **Draft**, its version retains the four conditions, and the new version stays inactive. If saving an edit to a rule that already has an active version, check that the previous active version stays effective.
+3. In the merchant's **Overview**, open **Merchant details → Business and integration settings → Custom fraud signals**. Register `custom_ip_country` with type **Country code**. The integration supplies the country of the transaction IP under `customSignals` using an uppercase ISO alpha-2 code, such as `US`.
+4. Return to **AI Rule**, select **Refresh rules** and then **Activate** on the saved draft. The stored proposal supplies all four requirements, so activation needs no new prompt or email entry.
+5. Run fresh test transactions that otherwise match the rule with network country `US`, with a different country, and with the country field omitted. Only the `US` case should match. Also try a `US` transaction at exactly 3,000 THB to check the strict cutoff.
+
 ### Composer and policy APIs
 
 Send the bearer credential for the scope you request. Use the issued merchant credential with the implicit tenant paths below. Use the configured demo admin credential with Platform paths or an explicit merchant path. Use shell variables for the credentials in these examples and set `api` to your local backend base URL.
@@ -406,17 +414,17 @@ api=http://127.0.0.1:8081
 curl --fail-with-body --silent --show-error \
   -H "Authorization: Bearer ${merchant_token}" \
   -H 'Content-Type: application/json' \
-  --data '{"scope":"MERCHANT","requireAI":true,"instruction":"Block flight tickets when email domain equals example.test."}' \
+  --data '{"scope":"MERCHANT","requireAI":true,"reviewWithJev":true,"instruction":"Block flight tickets when email domain equals example.test."}' \
   "$api/api/v1/booking/rule-composer/interpret"
 
 curl --fail-with-body --silent --show-error \
   -H "Authorization: Bearer ${admin_token}" \
   -H 'Content-Type: application/json' \
-  --data '{"scope":"PLATFORM","requireAI":true,"instruction":"At payment, review when there were more than five orders on the same device in 60 seconds."}' \
+  --data '{"scope":"PLATFORM","requireAI":true,"reviewWithJev":true,"instruction":"At payment, review when there were more than five orders on the same device in 60 seconds."}' \
   "$api/api/v1/booking/rule-composer/interpret"
 ```
 
-An interpretation returns `READY` with a validated proposal and a shared, read-only `definition` with `schemaVersion: 1`. A `CLARIFICATION` includes a message or validation errors and omits the definition. With `requireAI: true`, a completed AI interpretation has `source: openai` and includes `model`. Existing clients that omit `requireAI` can also receive `local` or `local_fallback`. Pass the returned scope-specific proposal as `{"proposal":{...}}` when saving. For a Platform draft with replay, add `"runId"` to the save body. [Shared rule preview data](requirements/ai-rule-management.md#shared-rule-preview-data)
+An interpretation returns `READY` with a validated proposal and a shared, read-only `definition` with `schemaVersion: 1`. A `CLARIFICATION` includes a message or validation errors. A complete Jev-reviewed exact-email rule that requires an unregistered IP-country signal can return a `definition` for preview and a separate `draftProposal` for inactive saving. With `requireAI: true`, a completed AI interpretation has `source: openai` and includes `model`. The optional `reviewWithJev: true` also requires OpenAI and adds the independent `jevReview` status. Existing clients that omit both flags can also receive `local` or `local_fallback`. Pass the returned scope-specific proposal as `{"proposal":{...}}` when saving. For an inactive Merchant draft, use the returned `draftProposal` as `proposal` and include `"saveAsDraft": true`. For a Platform draft with replay, add `"runId"` to the save body. [Shared rule preview data](requirements/ai-rule-management.md#shared-rule-preview-data)
 
 | Method and path | Purpose |
 | --- | --- |
@@ -428,9 +436,9 @@ An interpretation returns `READY` with a validated proposal and a shared, read-o
 | `GET /api/v1/booking/rule-composer/platform/{id}/versions` | Administrator or checker reads the recorded revisions and current active version. |
 | `GET /api/v1/booking/demo/merchant-policy/profile` | Read the authorized merchant's products, stages, and available signals. |
 | `GET /api/v1/booking/demo/merchant-policy/rules` | List the authorized merchant's latest rules and effective versions. |
-| `POST /api/v1/booking/demo/merchant-policy/rules` | Save a validated proposal for the authorized merchant. |
+| `POST /api/v1/booking/demo/merchant-policy/rules` | Save a validated proposal for the authorized merchant. Add `saveAsDraft: true` to create an inactive version. |
 | `GET /api/v1/booking/demo/merchant-policy/rules/{id}` | Read the merchant's most recent rule version and history. |
-| `PUT /api/v1/booking/demo/merchant-policy/rules/{id}` | Save a new version with `proposal` and `expectedVersion`. |
+| `PUT /api/v1/booking/demo/merchant-policy/rules/{id}` | Save a new version with `proposal` and `expectedVersion`. Add `saveAsDraft: true` to leave the previous active version effective. |
 | `DELETE /api/v1/booking/demo/merchant-policy/rules/{id}` | Remove the rule from the current policy list with `expectedVersion`. Stored versions and assessments retain their evidence. |
 | `POST /api/v1/booking/demo/merchant-policy/rules/{id}/simulate` | Preview the latest policy over up to 200 of the merchant's recent stored transactions. |
 | `POST /api/v1/booking/demo/merchant-policy/rules/{id}/activate` | Revalidate and activate the selected policy version alongside the other active policies. Send `expectedVersion`. The preview records potential overlap. |

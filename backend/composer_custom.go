@@ -27,9 +27,11 @@ var (
 	customRuleConjunction  = regexp.MustCompile(`(?i)\s+(and|or|และ|หรือ)\s+`)
 	customRuleTyped        = regexp.MustCompile(`(?is)^(custom_[a-z][a-z0-9_]*)\s*(does not equal|at least|at most|greater than|less than|equals|contains|>=|<=|!=|=|>|<)\s*(.+)$`)
 	customRuleMeaning      = regexp.MustCompile(`(?is)^(custom_[a-z][a-z0-9_]*)\s*(?:means|refers to|looks like|matches the meaning of|หมายถึง|สื่อถึง)\s*(.+)$`)
-	customRuleCountry      = regexp.MustCompile(`(?is)^(?:ip country (?:is|equals)|ip (?:comes from|is from|from|มาจาก|จาก)|ประเทศไอพี(?:คือ|เท่ากับ))\s*(.+)$`)
+	customRuleCountry      = regexp.MustCompile(`(?is)^(?:ip(?: address)? country (?:is|equals)\b|ip(?: address)? (?:comes from|is from|from)\b|(?:ip|ไอพี)\s*(?:มาจาก|จาก)|ประเทศไอพี\s*(?:คือ|เท่ากับ))\s*(.+)$`)
 	customRuleBareAmount   = regexp.MustCompile(`(?i)^(?:amount|ยอด(?:เงิน)?)\s*(?:is\s+)?(?:at least|at most|greater than|less than|equals|does not equal|อย่างน้อย|ไม่เกิน|มากกว่า|น้อยกว่า|เท่ากับ|ไม่เท่ากับ|>=|<=|>|<|=|!=)\s*[0-9]+(?:\.[0-9]+)?$`)
 )
+
+const policyIPCountry = "custom_ip_country"
 
 // Draft from the original wording. No provider response is used to fill
 // unsupported fields, and only the merchant can confirm and save the draft.
@@ -187,11 +189,11 @@ func customStructuredCondition(clause string, profile merchantPolicyProfile, pro
 			return semanticRuleCondition(field, unquoteRuleText(match[2])), true
 		}
 	}
-	countryField, hasCountryField := composerAvailableField(profile, products, "custom_ip_country", "eq")
+	countryField, hasCountryField := composerAvailableField(profile, products, policyIPCountry, "eq")
 	if match := customRuleCountry.FindStringSubmatch(clause); match != nil && hasCountryField && countryField.DataType == "country" {
 		if country := customRuleCountryCode(match[1]); country != "" {
 			value, _ := json.Marshal(country)
-			return merchantPolicyCondition{Field: "custom_ip_country", Operator: "eq", Value: value}, true
+			return merchantPolicyCondition{Field: policyIPCountry, Operator: "eq", Value: value}, true
 		}
 	}
 	if match := customRuleTyped.FindStringSubmatch(clause); match != nil {
@@ -270,8 +272,8 @@ func customRuleTypedValue(dataType, raw string) (json.RawMessage, bool) {
 
 func customRuleCountryCode(raw string) string {
 	country := strings.TrimSpace(raw)
-	if len(country) == 2 {
-		if region, err := language.ParseRegion(strings.ToUpper(country)); err == nil && region.IsCountry() {
+	if len(country) == 2 || len(country) == 3 {
+		if region, err := language.ParseRegion(strings.ToUpper(country)); err == nil && region.IsCountry() && len(region.String()) == 2 {
 			return region.String()
 		}
 	}

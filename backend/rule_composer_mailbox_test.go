@@ -162,3 +162,121 @@ func TestComposePrivateMailboxWithOpenAIPostgres(t *testing.T) {
 		t.Fatalf("Expected nine OpenAI interactions, got %d.", calls)
 	}
 }
+
+func TestPrivateMailboxIPCountryDraftPostgres(t *testing.T) {
+	db := openPolicyTestDatabase(t)
+	repo := repository{db}
+	createMerchant := func(name string, fields []customSignalDefinition) (mockMerchant, string) {
+		t.Helper()
+		merchant, token, err := repo.createMockMerchant(t.Context(), mockMerchantInput{
+			Name: name, PolicyIntegration: &merchantPolicyIntegration{
+				Products: []string{"flight_ticket", "hotel_room"}, AmountMinor: true, CustomFields: fields,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return merchant, token
+	}
+	_, unregistered := createMerchant("Mailbox country unavailable", nil)
+	merchant, registered := createMerchant("Mailbox country configured", []customSignalDefinition{
+		{Key: policyIPCountry, Label: "Customer IP country", Type: "country"},
+	})
+	const markerReply = `{"status":"CLARIFICATION","message":"Please clarify [EXACT_EMAIL] and the price unit.","proposal":null}`
+	const ready = `{"status":"READY","message":"","proposal":{"scope":"MERCHANT","name":"US high-value flight","product_types":["flight_ticket"],"stages":["BOOKING"],"action":"BLOCK","conditions":{"logic":"AND","rules":[{"field":"custom_ip_country","operator":"eq","value":"US"},{"field":"order.amount_minor","operator":"gt","value":300000}]},"durationHours":null,"durationMinutes":null}}`
+	const instruction = "Block email [EXACT_EMAIL] and product = flight and price > 3000 and IP from USA"
+	const withUnits = "Block email [EXACT_EMAIL] and product = flight and price > 3000 THB and IP from USA"
+	digest := strings.Repeat("7", 64)
+	composer := ruleComposer{access: composerAuthorization(repo, "test-mailbox-country-key"), model: "test-model"}
+	var prompt, providerInstruction string
+	reply, calls := markerReply, 0
+	composer.provider = testComposerProvider(func(_ context.Context, _, policy, instruction string) ([]byte, error) {
+		calls++
+		prompt, providerInstruction = policy, instruction
+		return []byte(reply), nil
+	})
+	send := func(token, instruction string, status int, jevReview ...bool) []byte {
+		t.Helper()
+		payload, _ := json.Marshal(map[string]any{
+			"scope": composerMerchant, "instruction": instruction, "mailboxDigest": digest, "requireAI": true,
+			"reviewWithJev": len(jevReview) > 0 && jevReview[0],
+		})
+		req := httptest.NewRequest(http.MethodPost, composerPath+"/interpret", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		before := calls
+		composer.interpret(response, req)
+		if response.Code != status {
+			t.Fatalf("Expected HTTP %d, got %d: %s", status, response.Code, response.Body.String())
+		}
+		if calls != before+1 || providerInstruction != instruction || strings.Contains(prompt+providerInstruction, digest) {
+			t.Fatal("Draft must call OpenAI with the redacted instruction only.")
+		}
+		return response.Body.Bytes()
+	}
+	result := send(unregistered, instruction, http.StatusOK)
+	if !bytes.Contains(result, []byte(`"clarificationCode":"IP_COUNTRY_UNAVAILABLE"`)) ||
+		!bytes.Contains(result, []byte(`"source":"openai"`)) || bytes.Contains(result, []byte(`"proposal"`)) {
+		t.Fatalf("Missing IP country evidence must take precedence over ambiguous price units: %s", result)
+	}
+	result = send(registered, instruction, http.StatusOK)
+	if !bytes.Contains(result, []byte(`"clarificationCode":"AMOUNT_UNIT_REQUIRED"`)) || bytes.Contains(result, []byte(`"proposal"`)) {
+		t.Fatalf("An available IP country field allows clarification about ambiguous price units: %s", result)
+	}
+	result = send(unregistered, instruction, http.StatusOK, true)
+	if !bytes.Contains(result, []byte(`"clarificationCode":"AMOUNT_UNIT_REQUIRED"`)) {
+		t.Fatalf("The Jev draft path should ask for the unit before trying to draft the missing signal: %s", result)
+	}
+	result = send(registered, "Block email [EXACT_EMAIL] when the booking is suspicious", http.StatusOK)
+	if !bytes.Contains(result, []byte("the specified email address")) || bytes.Contains(result, []byte("[EXACT_EMAIL]")) {
+		t.Fatalf("An OpenAI clarification should present the private reference in ordinary words: %s", result)
+	}
+	reply = ready
+	result = send(unregistered, withUnits, http.StatusOK, true)
+	if !bytes.Contains(result, []byte(`"clarificationCode":"IP_COUNTRY_UNAVAILABLE"`)) ||
+		!bytes.Contains(result, []byte(`"definition":`)) ||
+		!bytes.Contains(result, []byte(`"draftProposal":`)) ||
+		!bytes.Contains(result, []byte(`"field":"custom_ip_country","operator":"eq","value":"US"`)) ||
+		!bytes.Contains(result, []byte(`"field":"customer.mailbox_ref","operator":"eq","value":null`)) ||
+		!bytes.Contains(result, []byte(`"jevReview":`)) || bytes.Contains(result, []byte(`"proposal"`)) {
+		t.Fatalf("A missing integration must allow a Jev-reviewed draft without an activatable proposal: %s", result)
+	}
+	for _, text := range []string{withUnits, "บล็อกอีเมล [EXACT_EMAIL] และตั๋วเครื่องบิน และราคาเกิน 3,000 บาท และไอพีมาจากสหรัฐอเมริกา"} {
+		var result struct {
+			Status, Source string
+			Proposal       merchantPolicyProposal
+		}
+		if err := json.Unmarshal(send(registered, text, http.StatusOK), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Status != "READY" || result.Source != composerSourceOpenAI ||
+			!strings.Contains(prompt, `{"field":"custom_ip_country","operator":"eq","value":"US"}`) ||
+			!strings.Contains(prompt, `{"field":"order.amount_minor","operator":"gt","value":300000}`) {
+			t.Fatalf("Model did not supply the complete grounded rule: %+v", result)
+		}
+		ref, err := merchantMailboxRef(t.Context(), db, merchant.ID, digest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		amount := int64(300001)
+		evidence := merchantPolicyEvidence{
+			product: "flight_ticket", stage: "BOOKING", mailboxRef: ref, amount: &amount,
+			custom: map[string]json.RawMessage{policyIPCountry: json.RawMessage(`"US"`)},
+		}
+		if matched, missing := result.Proposal.evaluate(evidence); !matched || missing {
+			t.Fatal("US IP country with the other matching conditions must block.")
+		}
+		evidence.custom[policyIPCountry] = json.RawMessage(`"TH"`)
+		if matched, missing := result.Proposal.evaluate(evidence); matched || missing {
+			t.Fatal("A different IP country must not match.")
+		}
+		evidence.custom = nil
+		if matched, missing := result.Proposal.evaluate(evidence); matched || !missing {
+			t.Fatal("Absent country evidence must be missing rather than matching.")
+		}
+	}
+	reply = strings.Replace(ready, `{"field":"custom_ip_country","operator":"eq","value":"US"},`, "", 1)
+	send(registered, withUnits, http.StatusBadGateway)
+	reply = strings.Replace(ready, `"value":"US"`, `"value":"TH"`, 1)
+	send(registered, withUnits, http.StatusBadGateway)
+}

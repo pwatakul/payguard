@@ -24,6 +24,8 @@ test("adds the chosen price unit without dropping conditions or changing the thr
   assert.equal(needsMailboxPriceUnit(thai + " บาท"), false);
   assert.equal(needsMailboxPriceUnit(english + " minor units"), false);
   assert.equal(applyMailboxPriceUnit("price < 5000 and amount > 1000", "THB"), null);
+  const withIP = "block email [EXACT_EMAIL] and product = flight and price > 3000 and ip from usa";
+  assert.equal(applyMailboxPriceUnit(withIP, "THB"), withIP.replace("3000", "3000 THB"));
 });
 
 test("shares only ASCII username shape counts for a full mailbox", () => {

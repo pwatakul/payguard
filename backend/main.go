@@ -105,7 +105,7 @@ func main() {
 	registerBookingOps(mux, a.repo, bookingAuth, a.secret)
 	adminToken := demoCredential("PAYGUARD_DEMO_ADMIN_TOKEN")
 	registerMerchantDemo(mux, a.repo, adminToken, merchantJev)
-	registerRuleComposer(mux, a, adminToken)
+	registerRuleComposer(mux, a, adminToken, merchantJev)
 	registerJevAIConfiguration(mux, a.repo, adminToken, merchantJev)
 	registerPlatformRuleGovernance(mux, a.repo, adminToken, demoCredential("PAYGUARD_PLATFORM_RULE_CHECKER_TOKEN"))
 	registerBookingDossiers(mux, a.repo, bookingAuth)

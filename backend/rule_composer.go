@@ -44,6 +44,7 @@ type ruleComposer struct {
 	provider     ruleComposerProvider
 	providerName string
 	model        string
+	jev          merchantJev
 }
 
 type platformComposerProposal struct {
@@ -58,14 +59,17 @@ type composerValidation struct {
 }
 
 type composerInterpretation struct {
-	Status        string                 `json:"status"`
-	Source        string                 `json:"source,omitempty"`
-	Model         string                 `json:"model,omitempty"`
-	Proposal      any                    `json:"proposal,omitempty"`
-	Definition    *ruleDefinition        `json:"definition,omitempty"`
-	Validation    composerValidation     `json:"validation"`
-	Message       string                 `json:"message,omitempty"`
-	SemanticDraft *composerSemanticDraft `json:"semanticDraft,omitempty"`
+	ClarificationCode string                  `json:"clarificationCode,omitempty"`
+	Status            string                  `json:"status"`
+	Source            string                  `json:"source,omitempty"`
+	Model             string                  `json:"model,omitempty"`
+	Proposal          any                     `json:"proposal,omitempty"`
+	DraftProposal     *merchantPolicyProposal `json:"draftProposal,omitempty"`
+	Definition        *ruleDefinition         `json:"definition,omitempty"`
+	Validation        composerValidation      `json:"validation"`
+	Message           string                  `json:"message,omitempty"`
+	SemanticDraft     *composerSemanticDraft  `json:"semanticDraft,omitempty"`
+	JevReview         *composerJevReview      `json:"jevReview,omitempty"`
 }
 
 type composerSemanticDraft struct {
@@ -91,8 +95,8 @@ func platformRuleWrite(repo repository, adminToken string, next http.HandlerFunc
 	}
 }
 
-func registerRuleComposer(mux *http.ServeMux, a app, adminToken string) {
-	composer := ruleComposer{access: composerAuthorization(a.repo, adminToken)}
+func registerRuleComposer(mux *http.ServeMux, a app, adminToken string, jev merchantJev) {
+	composer := ruleComposer{access: composerAuthorization(a.repo, adminToken), jev: jev}
 	provider, err := configuredRuleComposer()
 	if err != nil {
 		log.Printf("rule interpretation disabled: %v", err)
@@ -199,9 +203,13 @@ func (s ruleComposer) interpret(w http.ResponseWriter, r *http.Request) {
 		MailboxBlock  *mailboxBlockInstruction `json:"mailboxBlock"`
 		MailboxDigest string                   `json:"mailboxDigest"`
 		RequireAI     bool                     `json:"requireAI"`
+		ReviewWithJev bool                     `json:"reviewWithJev"`
 	}
 	if !decodeBookingRiskJSON(w, r, &input) {
 		return
+	}
+	if input.ReviewWithJev {
+		input.RequireAI = true
 	}
 	if input.Scope != composerMerchant && input.Scope != composerPlatform {
 		problem(w, http.StatusUnprocessableEntity, "Choose MERCHANT or PLATFORM rule scope.")
@@ -264,7 +272,7 @@ func (s ruleComposer) interpret(w http.ResponseWriter, r *http.Request) {
 			problem(w, http.StatusUnprocessableEntity, "Draft the rule with one exact email address in Merchant AI Rules.")
 			return
 		}
-		s.interpretCompoundMailbox(w, r, actor, instruction, input.MailboxDigest, started)
+		s.interpretCompoundMailbox(w, r, actor, instruction, input.MailboxDigest, started, input.ReviewWithJev)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 18*time.Second)
@@ -354,7 +362,7 @@ func (s ruleComposer) interpret(w http.ResponseWriter, r *http.Request) {
 	s.audit("interpret", input.Scope, actor, output.Status, "", started)
 	output.Source = composerSourceOpenAI
 	output.Model = s.model
-	respondRuleInterpretation(w, output)
+	s.respondAIInterpretation(w, r, actor, output, input.Scope, input.ReviewWithJev)
 }
 
 func (s ruleComposer) respondLocalFallback(w http.ResponseWriter, actor mockMerchantActor, instruction string, profile merchantPolicyProfile, reason string, started time.Time) {

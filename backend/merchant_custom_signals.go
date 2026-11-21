@@ -185,7 +185,9 @@ func checkCustomFieldChanges(ctx context.Context, tx pgx.Tx, merchant string, ne
 			continue
 		}
 		var used bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM merchant_policy_rule_versions WHERE merchant_id=$1::text::uuid AND proposal->'conditions'->'rules' @> jsonb_build_array(jsonb_build_object('field',$2::text)))
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM merchant_policy_rule_versions WHERE merchant_id=$1::text::uuid
+			AND NOT COALESCE(preview->'missingSignals' ? $2::text, false)
+			AND proposal->'conditions'->'rules' @> jsonb_build_array(jsonb_build_object('field',$2::text)))
 			OR EXISTS (SELECT 1 FROM merchant_demo_transactions WHERE merchant_id=$1::text::uuid AND custom_signals ? $2::text)`, merchant, old.Key).Scan(&used); err != nil {
 			return err
 		}

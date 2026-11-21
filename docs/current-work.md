@@ -12,6 +12,28 @@ The working tree reduces merchant creation to one required field and one submiss
 - Six isolated synthetic cases passed against the revised backend using live OpenAI on `gpt-4.1-mini`. They verified clarification for a missing price unit, English and Thai exact-email flight blocks with a strict comparison above 500,000 minor units for 5,000 THB, a two-minute exact-email draft, and general Merchant and Platform drafts.
 - An independent full Go suite run against fresh PostgreSQL recorded 386 passing tests and subtests with zero failures or skips. Two command packages have no tests. Go vet and `git diff --check` passed. Fourteen frontend tests, TypeScript checking, the production build, and an isolated browser check passed.
 
+### Exact-email draft with IP country
+
+The previous composer returned HTTP 502 for a synthetic version of the Gother request. Gother's profile currently lacks the `custom_ip_country` field. The initial fix replaced the error with setup guidance and validated that the OpenAI draft requires the exact mailbox, a flight, a price strictly above 3,000 THB, and the integration's IP-country code `US`. Gother's integration configuration and saved rules were left untouched. [IP-country test workflow](simulation-runbook.md#exact-email-with-product-price-and-ip-country)
+
+- Five synthetic cases passed against live OpenAI. The browser verified the setup guidance, and the frontend passed 14 Node tests, TypeScript checking, and the production build.
+- The final Go suite reported 387 passing tests and subtests. Seven independent overlay checks and Go vet also passed. Upstream deployment was outside this verification.
+
+### Jev review of OpenAI drafts
+
+Both Platform and Merchant **Draft rule** actions use OpenAI to produce the rule structure and send its sanitized definition to the effective Jev provider for an advisory review. The preview identifies the OpenAI model and available Jev result, served model, and decision ID. With the price unit supplied, Gother can preview the full `AND` definition before registering the IP-country signal. The latest save workflow can keep that definition as an inactive draft. [Draft review contract](requirements/ai-rule-management.md#shared-rule-preview-data) · [Local walkthrough](simulation-runbook.md#ai-rule-composer)
+
+- Four isolated synthetic cases passed with OpenAI `gpt-4.1-mini` followed by OpenRouter Jev `typesafe/jev-1.14` and live provider decision IDs.
+- The earlier local smoke checks returned live Jev reviews for both scopes after the local Jev environment switched from mock to live. At that point Gother's response carried a display-only four-condition definition.
+- Focused Go tests, their race-enabled run, and Go vet passed. The frontend passed 14 Node tests, TypeScript checking, and the production build.
+
+### Saving a draft before IP-country setup
+
+**Save rule** now stores a complete exact-email rule as a **Draft** when it requires IP country and the merchant has yet to register the signal. The draft retains all four conditions and leaves any earlier active version effective. After registering `custom_ip_country` as **Country code**, select **Refresh rules** and **Activate** on the saved draft. Activation validates the current field and uses the saved proposal. [IP-country test workflow](simulation-runbook.md#exact-email-with-product-price-and-ip-country)
+
+- A disposable PostgreSQL workflow using live OpenAI and OpenRouter Jev verified that saving and reloading retains the draft, and retrying the same save returns the existing version. Activation was rejected before valid IP-country registration. After setup, explicit activation used the same saved four-condition rule without another AI call.
+- The independent Go suite passed 391 tests and subtests on disposable PostgreSQL with zero failures or skips. Go vet, all 14 frontend tests, TypeScript checking, the frontend build, and the browser save and activate flow passed. The checks saved no rule for Gother.
+
 ## Concurrent Merchant Rules and shared AI Rule preview
 
 Explicit activation can make multiple Merchant Rules effective together, including policies with potential overlap. Each rule retains its own effective version and history. The Platform and Merchant composer previews share the versioned `definition` format. Saves continue to use the validated proposal for each scope. [Rule data and lifecycle](requirements/ai-rule-management.md#shared-rule-preview-data) · [Multi-rule test walkthrough](simulation-runbook.md#test-multiple-active-merchant-rules)

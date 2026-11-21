@@ -35,8 +35,9 @@ ALTER TABLE merchant_policy_rule_versions ADD COLUMN IF NOT EXISTS instruction t
 `
 
 var (
-	errPolicyVersion   = errors.New("This rule changed. Reload its latest version before retrying.")
-	errPolicyRuleLimit = errors.New("This merchant has reached the limit of 50 policy rules.")
+	errPolicyVersion           = errors.New("This rule changed. Reload its latest version before retrying.")
+	errPolicyRuleLimit         = errors.New("This merchant has reached the limit of 50 policy rules.")
+	errPolicyIPCountryRequired = merchantPolicyValidationError{errors.New("Register custom_ip_country as a Country code signal for the selected products before using this rule.")}
 )
 
 type merchantPolicyIntegration struct {
@@ -64,6 +65,7 @@ type merchantPolicyPreview struct {
 	RequiresJev     int      `json:"requiresJev,omitempty"`
 	ConflictRuleIDs []string `json:"conflictRuleIds,omitempty"`
 	ApprovalReason  string   `json:"approvalReason,omitempty"`
+	MissingSignals  []string `json:"missingSignals,omitempty"`
 }
 
 type merchantPolicyRule struct {
@@ -322,6 +324,12 @@ type merchantPolicyMutation struct {
 	RollbackVersion int
 	Proposal        merchantPolicyProposal
 	Instruction     string
+	SaveAsDraft     bool
+}
+
+func merchantPolicyIPCountryAvailable(proposal merchantPolicyProposal, profile merchantPolicyProfile) bool {
+	field, available := composerAvailableField(profile, proposal.ProductTypes, policyIPCountry, "eq")
+	return available && field.DataType == "country"
 }
 
 func (r repository) mutateMerchantPolicy(ctx context.Context, merchant string, request merchantPolicyMutation) (merchantPolicyRule, error) {
@@ -348,6 +356,8 @@ func (r repository) mutateMerchantPolicy(ctx context.Context, merchant string, r
 		}
 		proposal := request.Proposal
 		instruction := request.Instruction
+		waitingForCountry := slices.Contains(current.Preview.MissingSignals, policyIPCountry)
+		restoreDraft := false
 		var rollback *int
 		switch request.Kind {
 		case "activate", "disable", "delete":
@@ -369,6 +379,8 @@ func (r repository) mutateMerchantPolicy(ctx context.Context, merchant string, r
 			}
 			proposal, rollback = previous.Proposal, &request.RollbackVersion
 			instruction = previous.Instruction
+			restoreDraft = slices.Contains(previous.Preview.MissingSignals, policyIPCountry)
+			waitingForCountry = waitingForCountry || restoreDraft
 		}
 		status := "ACTIVE"
 		var preview merchantPolicyPreview
@@ -378,15 +390,29 @@ func (r repository) mutateMerchantPolicy(ctx context.Context, merchant string, r
 		}
 		if request.Kind == "disable" || request.Kind == "delete" {
 			status = "DISABLED"
+			preview.MissingSignals = current.Preview.MissingSignals
 		} else {
 			profile, evidence, err := readMerchantPolicyContext(ctx, tx, merchant)
 			if err != nil {
 				return err
 			}
+			hasCountry := slices.ContainsFunc(proposal.Conditions.Rules, func(condition merchantPolicyCondition) bool {
+				return condition.Field == policyIPCountry
+			})
+			exactEmailDraft := request.SaveAsDraft && policyExclusiveText(proposal, policyMailbox) != ""
+			missingCountry := hasCountry && (waitingForCountry || exactEmailDraft) && !merchantPolicyIPCountryAvailable(proposal, profile)
+			if missingCountry {
+				if !exactEmailDraft {
+					return errPolicyIPCountryRequired
+				}
+				profile = mailboxDraftIPCountryProfile(profile)
+			}
 			if err := proposal.validate(profile); err != nil {
 				return merchantPolicyValidationError{err}
 			}
-			preview = previewMerchantPolicy(proposal, evidence)
+			if !missingCountry {
+				preview = previewMerchantPolicy(proposal, evidence)
+			}
 			if request.ID == "" {
 				rules, err := readMerchantPolicies(ctx, tx, merchant, false)
 				if err != nil {
@@ -418,6 +444,11 @@ func (r repository) mutateMerchantPolicy(ctx context.Context, merchant string, r
 			}
 			if request.Kind != "activate" {
 				switch {
+				case missingCountry:
+					preview.MissingSignals = []string{policyIPCountry}
+					preview.ApprovalReason = "Register the IP country signal before activating this draft."
+				case request.SaveAsDraft || restoreDraft:
+					preview.ApprovalReason = "Saved as a draft. Explicit activation is required."
 				case len(preview.ConflictRuleIDs) > 0:
 					preview.ApprovalReason = "This rule may overlap with active rules that take a different action. Review their actions before activating."
 				case proposal.Action == "BLOCK" && broadMerchantBlock(proposal):

@@ -162,6 +162,7 @@ func (s mockMerchantService) policyMutate(w http.ResponseWriter, r *http.Request
 		Version         int                    `json:"version"`
 		ExpectedVersion int                    `json:"expectedVersion"`
 		Instruction     string                 `json:"instruction"`
+		SaveAsDraft     bool                   `json:"saveAsDraft"`
 	}{}
 	operation := "save"
 	id := r.PathValue("id")
@@ -184,15 +185,29 @@ func (s mockMerchantService) policyMutate(w http.ResponseWriter, r *http.Request
 			merchantPolicyError(w, err)
 			return
 		}
-		_, evidence, err := readMerchantPolicyContext(r.Context(), s.repo.db, merchant)
+		profile, evidence, err := readMerchantPolicyContext(r.Context(), s.repo.db, merchant)
 		if err != nil {
 			merchantPolicyError(w, err)
 			return
+		}
+		if slices.Contains(rule.Preview.MissingSignals, policyIPCountry) {
+			if !merchantPolicyIPCountryAvailable(rule.Proposal, profile) {
+				merchantPolicyError(w, errPolicyIPCountryRequired)
+				return
+			}
+			if err := rule.Proposal.validate(profile); err != nil {
+				merchantPolicyError(w, merchantPolicyValidationError{err})
+				return
+			}
 		}
 		respond(w, http.StatusOK, map[string]any{"preview": previewMerchantPolicy(rule.Proposal, evidence)})
 		return
 	}
 	if !decodeBookingRiskJSON(w, r, &input) {
+		return
+	}
+	if input.SaveAsDraft && operation != "save" && operation != "edit" {
+		merchantPolicyError(w, merchantPolicyValidationError{errors.New("Save as draft is available when creating or editing a rule.")})
 		return
 	}
 	instruction := strings.TrimSpace(input.Instruction)
@@ -229,7 +244,7 @@ func (s mockMerchantService) policyMutate(w http.ResponseWriter, r *http.Request
 	}
 	rule, err := s.repo.mutateMerchantPolicy(r.Context(), merchant, merchantPolicyMutation{
 		Actor: auditActor(r.Context(), actor), Kind: operation, ID: id, ExpectedVersion: input.ExpectedVersion, RollbackVersion: input.Version,
-		Proposal: input.Proposal, Instruction: instruction,
+		Proposal: input.Proposal, Instruction: instruction, SaveAsDraft: input.SaveAsDraft,
 	})
 	if err != nil {
 		merchantPolicyError(w, err)
